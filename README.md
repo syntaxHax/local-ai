@@ -2,6 +2,8 @@
 
 A tiny Bash helper for listing, launching, and removing local **GGUF** models (Ollama-friendly), utilizing VSCodium and the Continue extension to aid with local coding / development.
 
+Tested and developed using Ubuntu 24.04 LTS.
+
 ---
 
 ## 📣 Banner
