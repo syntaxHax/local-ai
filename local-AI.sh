@@ -10,9 +10,9 @@ else
   CYAN=""; YEL=""; RED=""; RST=""
 fi
 
-log()  { printf "%s[INFO]%s %s\n" "$CYAN" "$RST" "$*"; }
-warn() { printf "%s[WARN]%s %s\n" "$YEL" "$RST" "$*"; }
-err()  { printf "%s[ERR ]%s %s\n" "$RED" "$RST" "$*"; }
+log()  { printf "%s[INFO]%s %s\n" "$CYAN" "$RST" "$*" >&2; }
+warn() { printf "%s[WARN]%s %s\n" "$YEL" "$RST" "$*" >&2; }
+err()  { printf "%s[ERR ]%s %s\n" "$RED" "$RST" "$*" >&2; }
 
 # UI HELPERS (PROMPTS)
 ask() {
@@ -46,7 +46,6 @@ confirm() {
   [[ "${yn,,}" =~ ^y(es)?$ ]]
 }
 
-
 # MISC HELPERS
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -61,7 +60,6 @@ wait_for_ollama() {
 
 alias_base() { local a="${1-}"; echo "${a%%:*}"; }
 
-
 # MODEL ENUMERATION (Ollama)
 get_model_names() {
   if curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
@@ -74,7 +72,6 @@ get_model_names() {
   fi
   ollama list 2>/dev/null | awk 'NR>1 && $1!="" {print $1}'
 }
-
 
 # BANNER / USAGE
 print_banner() {
@@ -116,7 +113,6 @@ Options:
 EOF
 }
 
-
 # WORKDIR HELPERS
 default_workspace_from_script() {
   local sdir; sdir="$(cd "$(dirname "${BASH_SOURCE[0]:-${0}}")" && pwd)"
@@ -132,7 +128,6 @@ detect_workdir_for_purge() {
   [[ -d "$HOME/llm" ]] && { echo "$HOME/llm"; return 0; }
   return 1
 }
-
 
 # CONTINUE EXTENSION CONFIG
 CONTINUE_CFG() { echo "$HOME/.continue/config.yaml"; }
@@ -182,13 +177,12 @@ YAML
   log "Updated Continue config at $(CONTINUE_CFG) with ${#models_arr[@]} Ollama model(s)."
 }
 
-
 # OLLAMA PROBES / TESTS / MODFILE WRITER
 probe_ok() {
   local model="$1"; local timeout_s="${2:-60}"
   local body
   body="$(jq -nc --arg m "$model" --arg p "ping" \
-          '{model:$m, prompt:$p, stream:false, options:{num_predict:1}}')"
+          '{model:$m, prompt:$p, stream:false, keep_alive:0, options:{num_predict:1}}')"
   curl -sfm "$timeout_s" http://127.0.0.1:11434/api/generate \
     -H 'Content-Type: application/json' -d "$body" >/dev/null
 }
@@ -204,14 +198,12 @@ quick_test() {
   local base="${model%%:*}"
   local expected="hello from $base"
 
-  local body resp trimmed
+  local body resp trimmed inside
   body="$(jq -nc --arg m "$model" --arg exp "$expected" \
-    '{
-      model: $m,
-      prompt: ("Return exactly: " + $exp),
-      stream: false,
-      options: { temperature: 0, top_p: 1, repeat_penalty: 1.0, num_predict: 64, seed: 1 }
-    }')"
+    '{model:$m,
+      prompt: ("Respond with EXACTLY this, no code fences, no extras: <ANS>"+$exp+"</ANS>"),
+      stream:false, keep_alive:0,
+      options:{temperature:0, top_p:1, repeat_penalty:1.0, num_predict:64, seed:1}}')"
 
   resp="$(
     curl -sf http://127.0.0.1:11434/api/generate \
@@ -221,15 +213,18 @@ quick_test() {
   )"
 
   trimmed="$(printf '%s' "$resp" | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  inside="$(printf '%s' "$trimmed" | tr -d '\n' | sed -n 's/.*<ANS>\(.*\)<\/ANS>.*/\1/p')"
 
-  if grep -Fq -- "$expected" <<<"$trimmed"; then
-    log "Quick test: PASS — phrase found in model output"
-  else
-    warn "Quick test: content mismatch (expected phrase not found)."
-    log "Sample (<=160 chars):"
-    printf '%s' "$trimmed" | head -c 160 | tr -d '\n' | tee -a "$WORKDIR/logs/${model}.log"
-    echo
+  if [[ -n "$inside" && "$inside" == "$expected" ]]; then
+    log "Quick test: PASS — exact marker match"
+    return 0
   fi
+
+  warn "Quick test: content mismatch."
+  log "Sample (<=160 chars):"
+  printf '%s' "$trimmed" | head -c 160 | tr -d '\n' | tee -a "$WORKDIR/logs/${model}.log"
+  echo
+  return 1
 }
 
 write_modelfile_simple() {
@@ -246,7 +241,6 @@ PARAMETER num_batch ${batch}
 PARAMETER num_thread ${thr}
 EOF
 }
-
 
 # GPU DETECTION & DEFAULT PARAM PICKER
 detect_gpu_summary() {
@@ -311,7 +305,6 @@ NUM_THREAD=$thr
 EOF
 }
 
-
 # AUTO-TUNING (OOM & HEADROOM)
 tune_up_after_success() {
   local alias="$1" modfile="$2" from="$3"
@@ -371,14 +364,24 @@ tune_up_after_success() {
 oom_probe_and_autotune() {
   local alias="$1" modfile="$2" from="$3" ctx="$4" batch="$5" pred="$6" thr="$7"
   local attempt=0 max_attempts=6 changed=0
+  local last_ctx= last_batch= last_pred= last_thr=
+
   while (( attempt < max_attempts )); do
     (( attempt++ ))
     log "Load probe (attempt $attempt): ctx=$ctx batch=$batch pred=$pred"
+
     if probe_ok "$alias" 60; then
+      ollama stop "$alias" >/dev/null 2>&1 || true
       log "Probe succeeded."
+      last_ctx="$ctx"; last_batch="$batch"; last_pred="$pred"; last_thr="$thr"
+      echo "$last_ctx $last_batch $last_pred $last_thr"
       return 0
     fi
-    warn "Probe indicates memory pressure. Auto-tuning…"; changed=1
+
+    ollama stop "$alias" >/dev/null 2>&1 || true
+    warn "Probe indicates memory pressure. Auto-tuning…"
+    changed=1
+
     if   (( ctx > 12288 )); then ctx=12288
     elif (( ctx > 8192  )); then ctx=8192
     elif (( ctx > 6144  )); then ctx=6144
@@ -391,24 +394,28 @@ oom_probe_and_autotune() {
       elif (( batch > 128 )); then batch=128
       elif (( batch > 96  )); then batch=96
       elif (( batch > 64  )); then batch=64
-      else err "Still OOM after aggressive tuning (ctx=$ctx, batch=$batch). Consider a lighter quant."; return 1
+      else
+        err "Still OOM after aggressive tuning (ctx=$ctx, batch=$batch). Consider a lighter quant."
+        ollama stop "$alias" >/dev/null 2>&1 || true
+        return 1
       fi
     fi
+
     write_modelfile_simple "$modfile" "$from" "$ctx" "$pred" "$batch" "$thr"
     log "Re-creating '$alias' with tuned params…"
     apply_and_reload "$alias" "$modfile"
   done
+
   (( changed )) && warn "Auto-tuning exhausted attempts; model may still be constrained."
+  ollama stop "$alias" >/dev/null 2>&1 || true
   return 1
 }
-
 
 # VSCODIUM EXTENSION HELPER
 has_codium_extension() {
   local q; q="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
   codium --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -qx "$q"
 }
-
 
 # ALIAS / REGISTRATION HELPERS
 unique_alias() {
@@ -418,14 +425,76 @@ unique_alias() {
   echo "$cand"
 }
 
+# Unload any models currently resident in Ollama (frees VRAM)
+unload_all_ollama_models() {
+  ! need_cmd ollama && return 0
+
+  # Prefer native --all if available
+  if ollama stop --help 2>/dev/null | grep -q -- '--all'; then
+    ollama stop --all >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # Fallback: stop each running model/container
+  local -a running=()
+  mapfile -t running < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
+  if ((${#running[@]})); then
+    for id in "${running[@]}"; do
+      ollama stop "$id" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+fail_and_cleanup() {
+  local alias="$1"; local reason="$2"
+  # Best-effort unregister
+  ollama rm "$alias" >/dev/null 2>&1 || true
+
+  # Purge WORKDIR artifacts
+  local WORK=""; WORK="${WORKDIR:-}"
+  [[ -z "$WORK" ]] && WORK="$(detect_workdir_for_purge || true)"
+  if [[ -n "$WORK" && -d "$WORK" ]]; then
+    purge_files_for_alias "$WORK" "$alias" || true
+  fi
+
+  # Refresh Continue config from what Ollama still has
+  write_continue_config_from_ollama
+
+  err "$reason"
+  warn "Recommendation: try a lighter model/quant."
+  exit 1
+}
+
 write_and_create_with_probe() {
   local MODEL_ALIAS="$1" TARGET_PATH="$2" NUM_CTX="$3" NUM_PRED="$4" NUM_BATCH="$5" NUM_THREAD="$6" MODFILE="$7"
+
   write_modelfile_simple "$MODFILE" "$TARGET_PATH" "$NUM_CTX" "$NUM_PRED" "$NUM_BATCH" "$NUM_THREAD"
+  unload_all_ollama_models
+
   log "Registering model '$MODEL_ALIAS' → $TARGET_PATH"
   ollama create "$MODEL_ALIAS" -f "$MODFILE" 2>&1 | tee -a "$WORKDIR/logs/${MODEL_ALIAS}.log"
-  log "Auto OOM probe + tuning…"; oom_probe_and_autotune "$MODEL_ALIAS" "$MODFILE" "$TARGET_PATH" "$NUM_CTX" "$NUM_BATCH" "$NUM_PRED" "$NUM_THREAD" || true
-  log "Auto headroom autotune…";  tune_up_after_success "$MODEL_ALIAS" "$MODFILE" "$TARGET_PATH" "$NUM_CTX" "$NUM_BATCH" "$NUM_PRED" "$NUM_THREAD" || true
-  quick_test "$MODEL_ALIAS"
+
+  log "Auto OOM probe + tuning…"
+  local tuned
+  if ! tuned="$(oom_probe_and_autotune "$MODEL_ALIAS" "$MODFILE" "$TARGET_PATH" "$NUM_CTX" "$NUM_BATCH" "$NUM_PRED" "$NUM_THREAD")"; then
+    fail_and_cleanup "$MODEL_ALIAS" "Model failed to fit during probe/autotune on this GPU/VRAM."
+  fi
+
+  if [[ ! "$tuned" =~ ^[0-9]+[[:space:]][0-9]+[[:space:]][0-9]+[[:space:]][0-9]+$ ]]; then
+  fail_and_cleanup "$MODEL_ALIAS" "Autotune returned invalid parameters."
+  fi
+
+  read -r NUM_CTX NUM_BATCH NUM_PRED NUM_THREAD <<<"$tuned"
+
+  unload_all_ollama_models
+  log "Auto headroom autotune…"
+  if ! tune_up_after_success "$MODEL_ALIAS" "$MODFILE" "$TARGET_PATH" "$NUM_CTX" "$NUM_BATCH" "$NUM_PRED" "$NUM_THREAD"; then
+    :
+  fi
+
+  if ! quick_test "$MODEL_ALIAS"; then
+    fail_and_cleanup "$MODEL_ALIAS" "Model responded but quick-test string check failed (not a VRAM issue)."
+  fi
 }
 
 register_models() {
@@ -474,7 +543,6 @@ register_models() {
   write_continue_config_from_ollama
 }
 
-
 # PURGE / REMOVE
 purge_files_for_alias() {
   local workdir="$1" alias_in="$2"
@@ -521,7 +589,6 @@ remove_one_alias() {
   fi
   write_continue_config_from_ollama
 }
-
 
 # SYSTEM SETUP (APT, NVIDIA, OLLAMA, FIREWALL, VSCODIUM)
 apt_install_missing() {
@@ -570,7 +637,6 @@ apply_acls_full_chain() {
   sudo -u ollama bash -lc "ls -ld '$models_dir' >/dev/null 2>&1 && touch '$models_dir/.acl_probe' && rm -f '$models_dir/.acl_probe'" 2>/dev/null || true
 }
 
-
 # ARG PARSING
 LIST_ONLY=no
 REMOVE_ALIASES=()
@@ -579,13 +645,7 @@ ARGS=()
 
 parse_args() {
   if [[ $# -eq 0 ]]; then
-    print_banner; print_version
-    cat <<'EOF'
-
-Usage: local-AI.sh /path/to/gguf/model.gguf
-       local-AI.sh --list
-       local-AI.sh --remove <ALIAS>
-EOF
+    print_help
     exit 0
   fi
 
@@ -609,13 +669,11 @@ EOF
   fi
 }
 
-
 # MAIN EXECUTION
 main() {
   parse_args "$@"
   set -- "${ARGS[@]}"
 
-  # list-only early exit
   if [[ "$LIST_ONLY" == yes ]]; then
     if need_cmd ollama; then
       mapfile -t LINES < <(get_model_names)
@@ -636,7 +694,6 @@ main() {
     exit 0
   fi
 
-  # remove-only early exit
   if [[ ${#REMOVE_ALIASES[@]} -gt 0 ]]; then
     STATUS=0; for a in "${REMOVE_ALIASES[@]}"; do remove_one_alias "$a" || STATUS=1; done
     exit "$STATUS"
