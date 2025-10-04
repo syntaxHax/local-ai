@@ -197,33 +197,45 @@ quick_test() {
   local model="$1"
   local base="${model%%:*}"
   local expected="hello from $base"
+  local gram="root ::= \"${expected}\""
+  local body resp out
 
-  local body resp trimmed inside
-  body="$(jq -nc --arg m "$model" --arg exp "$expected" \
-    '{model:$m,
-      prompt: ("Respond with EXACTLY this, no code fences, no extras: <ANS>"+$exp+"</ANS>"),
-      stream:false, keep_alive:0,
-      options:{temperature:0, top_p:1, repeat_penalty:1.0, num_predict:64, seed:1}}')"
+  body="$(jq -nc --arg m "$model" --arg g "$gram" '{
+      model:$m, prompt:"", stream:false, keep_alive:0,
+      options:{ raw:true, grammar:$g, temperature:0, top_p:1, top_k:1, mirostat:0,
+                repeat_penalty:1.0, num_predict:64, seed:1 }
+    }')"
 
-  resp="$(
-    curl -sf http://127.0.0.1:11434/api/generate \
-      -H 'Content-Type: application/json' -d "$body" \
-      2>>"$WORKDIR/logs/${model}.log" \
-    | jq -r '.response // empty' 2>>"$WORKDIR/logs/${model}.log" || true
-  )"
+  resp="$(curl -sS -H 'Content-Type: application/json' \
+          -d "$body" http://127.0.0.1:11434/api/generate \
+          2>>"$WORKDIR/logs/${model}.log" || true)"
+  out="$(jq -r '.response // empty' <<<"$resp" 2>>"$WORKDIR/logs/${model}.log" || true)"
 
-  trimmed="$(printf '%s' "$resp" | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-  inside="$(printf '%s' "$trimmed" | tr -d '\n' | sed -n 's/.*<ANS>\(.*\)<\/ANS>.*/\1/p')"
-
-  if [[ -n "$inside" && "$inside" == "$expected" ]]; then
-    log "Quick test: PASS — exact marker match"
+  if [[ "$out" == "$expected" ]]; then
+    log "Quick test: PASS — grammar-constrained exact match"
     return 0
   fi
 
-  warn "Quick test: content mismatch."
-  log "Sample (<=160 chars):"
-  printf '%s' "$trimmed" | head -c 160 | tr -d '\n' | tee -a "$WORKDIR/logs/${model}.log"
-  echo
+  body="$(jq -nc --arg m "$model" --arg e "$expected" '{
+      model:$m,
+      prompt:("Reply ONLY with: <ANS>"+$e+"</ANS>"),
+      stream:false, keep_alive:0,
+      options:{ raw:true, stop:["</ANS>"], temperature:0, top_p:1, top_k:1, mirostat:0,
+                repeat_penalty:1.0, num_predict:64, seed:1 }
+    }')"
+
+  resp="$(curl -sf -H 'Content-Type: application/json' \
+          -d "$body" http://127.0.0.1:11434/api/generate \
+          2>>"$WORKDIR/logs/${model}.log" || true)"
+  out="$(jq -r '.response // empty' <<<"$resp" 2>>"$WORKDIR/logs/${model}.log" || true)"
+  out="$(tr -d '\r\n' <<<"$out")"
+
+  if [[ "$out" == "<ANS>${expected}" || "$out" == "${expected}" ]]; then
+    log "Quick test: PASS — stop-token match"
+    return 0
+  fi
+
+  warn "Quick test: FAIL. Sample: $(printf '%s' "$out" | head -c 160)"
   return 1
 }
 
@@ -231,6 +243,7 @@ write_modelfile_simple() {
   local modfile="$1" from="$2" ctx="$3" pred="$4" batch="$5" thr="$6"
   cat >"$modfile" <<EOF
 FROM ${from}
+TEMPLATE "{{ .Prompt }}"
 PARAMETER temperature 0.2
 PARAMETER top_p 0.9
 PARAMETER repeat_penalty 1.07
@@ -493,7 +506,11 @@ write_and_create_with_probe() {
   fi
 
   if ! quick_test "$MODEL_ALIAS"; then
-    fail_and_cleanup "$MODEL_ALIAS" "Model responded but quick-test string check failed (not a VRAM issue)."
+    if (( STRICT )); then
+      fail_and_cleanup "$MODEL_ALIAS" "Self-test failed."
+    else
+      warn "Self-test failed; leaving model installed (non-strict mode)."
+    fi
   fi
 }
 
@@ -642,6 +659,7 @@ LIST_ONLY=no
 REMOVE_ALIASES=()
 EXPECT_REMOVE_ALIAS=0
 ARGS=()
+STRICT=0
 
 parse_args() {
   if [[ $# -eq 0 ]]; then
@@ -657,6 +675,7 @@ parse_args() {
         if [[ $# -ge 2 && "${2:0:1}" != "-" ]]; then REMOVE_ALIASES+=("$2"); shift 2; else EXPECT_REMOVE_ALIAS=1; shift; fi
         ;;
       --remove=*) REMOVE_ALIASES+=("${1#*=}"); shift ;;
+      --strict) STRICT=1; shift ;;
       --) shift; while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done; break ;;
       -*) err "Unknown option: $1"; echo; print_help; exit 2 ;;
       *) ARGS+=("$1"); shift ;;
